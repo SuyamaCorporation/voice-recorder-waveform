@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Recorder with Live Waveform Canvas</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-white min-h-screen">
+<script>
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+let mediaRecorder=null, audioChunks=[];
+let audioCtx=null, analyser=null, source=null, animId=null;
+let isRecording=false;
+let recordings=[];
+let vizMode='waveform'; // waveform | frequency
+let startTime=null;
+let timerInterval=null;
+
+const MAX_RECORDINGS=5;
+const STORAGE_KEY='voice_recs_v1';
+
+function loadRecs(){
+  try{ recordings=JSON.parse(localStorage.getItem(STORAGE_KEY))||[]; }
+  catch{ recordings=[]; }
+}
+function saveRecs(){ localStorage.setItem(STORAGE_KEY,JSON.stringify(recordings)); }
+
+loadRecs();
+
+function setupAudio(stream){
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  analyser=audioCtx.createAnalyser();
+  analyser.fftSize=2048;
+  source=audioCtx.createMediaStreamSource(stream);
+  source.connect(analyser);
+}
+
+async function requestMic(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+    document.getElementById('micStatus').textContent='✅ Microphone connected';
+    document.getElementById('micStatus').className='text-green-400 text-sm';
+    document.getElementById('recordBtn').disabled=false;
+    document.getElementById('recordBtn').classList.remove('opacity-40','cursor-not-allowed');
+    setupAudio(stream);
+    mediaRecorder=new MediaRecorder(stream);
+    mediaRecorder.ondataavailable=e=>audioChunks.push(e.data);
+    mediaRecorder.onstop=onRecordStop;
+  } catch(err){
+    document.getElementById('micStatus').textContent='❌ Mic permission denied: '+escapeHtml(err.message);
+    document.getElementById('micStatus').className='text-red-400 text-sm';
+  }
+}
+
+function startRecording(){
+  if(isRecording||!mediaRecorder) return;
+  audioChunks=[];
+  mediaRecorder.start(100);
+  isRecording=true;
+  startTime=Date.now();
+  document.getElementById('recordBtn').textContent='⏹ Stop';
+  document.getElementById('recordBtn').onclick=stopRecording;
+  timerInterval=setInterval(updateTimer,100);
+  drawViz();
+}
+
+function stopRecording(){
+  if(!isRecording||!mediaRecorder) return;
+  mediaRecorder.stop();
+  isRecording=false;
+  clearInterval(timerInterval);
+  cancelAnimationFrame(animId);
+  document.getElementById('recordBtn').textContent='● Record';
+  document.getElementById('recordBtn').onclick=startRecording;
+  document.getElementById('timerDisp').textContent='00:00';
+  clearCanvas();
+}
+
+function onRecordStop(){
+  const blob=new Blob(audioChunks,{type:'audio/webm'});
+  const duration=(Date.now()-startTime)/1000;
+  const reader=new FileReader();
+  reader.onload=e=>{
+    const rec={id:Date.now(), date:new Date().toLocaleString(), duration:duration.toFixed(1), data:e.target.result};
+    if(recordings.length>=MAX_RECORDINGS) recordings.shift();
+    recordings.push(rec);
+    saveRecs();
+    renderList();
+  };
+  reader.readAsDataURL(blob);
+}
+
+function updateTimer(){
+  const elapsed=(Date.now()-startTime)/1000;
+  const m=Math.floor(elapsed/60).toString().padStart(2,'0');
+  const s=Math.floor(elapsed%60).toString().padStart(2,'0');
+  document.getElementById('timerDisp').textContent=`${m}:${s}`;
+}
+
+function clearCanvas(){
+  const canvas=document.getElementById('vizCanvas');
+  const ctx=canvas.getContext('2d');
+  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,canvas.width,canvas.height);
+}
+
+function drawViz(){
+  if(!isRecording){return;}
+  const canvas=document.getElementById('vizCanvas');
+  const ctx=canvas.getContext('2d');
+  const W=canvas.width, H=canvas.height;
+  animId=requestAnimationFrame(drawViz);
+  ctx.fillStyle='rgba(13,17,23,0.4)'; ctx.fillRect(0,0,W,H);
+
+  if(vizMode==='waveform'){
+    const buf=new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(buf);
+    ctx.beginPath(); ctx.strokeStyle='#22d3ee'; ctx.lineWidth=2;
+    const sliceW=W/buf.length;
+    buf.forEach((v,i)=>{
+      const y=(v/255)*H;
+      if(i===0) ctx.moveTo(0,y); else ctx.lineTo(i*sliceW,y);
+    });
+    ctx.stroke();
+
+    // VU meter
+    const sum=buf.reduce((a,b)=>a+Math.abs(b-128),0);
+    const rms=sum/buf.length/128;
+    updateVU(rms);
+  } else {
+    const buf=new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(buf);
+    const barW=W/buf.length*2.5;
+    buf.forEach((v,i)=>{
+      const barH=(v/255)*H;
+      const hue=240-i/buf.length*240;
+      ctx.fillStyle=`hsl(${hue},100%,50%)`;
+      ctx.fillRect(i*(barW+1),H-barH,barW,barH);
+    });
+  }
+}
+
+function updateVU(level){
+  const el=document.getElementById('vuMeter');
+  if(!el) return;
+  const pct=Math.min(100,level*400);
+  el.style.width=pct+'%';
+  el.style.background=pct>80?'#ef4444':pct>50?'#eab308':'#22c55e';
+}
+
+function deleteRec(id){
+  recordings=recordings.filter(r=>r.id!==id);
+  saveRecs(); renderList();
+}
+
+function downloadRec(id){
+  const rec=recordings.find(r=>r.id===id);
+  if(!rec) return;
+  const a=document.createElement('a');
+  a.href=rec.data; a.download=`recording-${id}.webm`; a.click();
+}
+
+function playRec(id){
+  const rec=recordings.find(r=>r.id===id);
+  if(!rec) return;
+  const audio=new Audio(rec.data); audio.play();
+}
+
+function renderList(){
+  const el=document.getElementById('recList');
+  if(!el) return;
+  if(recordings.length===0){ el.innerHTML='<div class="text-gray-500 text-sm text-center py-4">No recordings yet</div>'; return; }
+  el.innerHTML=recordings.slice().reverse().map(r=>`
+    <div class="bg-gray-800 rounded-xl p-3 flex items-center gap-3">
+      <div class="flex-1">
+        <div class="text-sm font-semibold">${escapeHtml(r.date)}</div>
+        <div class="text-xs text-gray-400">${escapeHtml(r.duration)}s</div>
+      </div>
+      <button onclick="playRec(${r.id})" class="bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded text-sm">▶ Play</button>
+      <button onclick="downloadRec(${r.id})" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm">⬇</button>
+      <button onclick="deleteRec(${r.id})" class="text-red-400 hover:text-red-300 px-2">✕</button>
+    </div>`).join('');
+}
+
+function setupCanvas(){
+  const canvas=document.getElementById('vizCanvas');
+  const cont=canvas.parentElement;
+  canvas.width=cont.clientWidth-4;
+  canvas.height=200;
+  clearCanvas();
+}
+window.addEventListener('resize',setupCanvas);
+</script>
+<div class="max-w-2xl mx-auto p-4">
+  <h1 class="text-2xl font-bold text-cyan-300 mb-4">🎙️ Voice Recorder + Waveform</h1>
+  <div class="bg-gray-900 rounded-2xl p-4 mb-4">
+    <button onclick="requestMic()" class="bg-blue-700 hover:bg-blue-600 px-4 py-2 rounded-lg font-semibold mb-3">🎤 Request Microphone</button>
+    <div id="micStatus" class="text-gray-400 text-sm mb-3">Microphone not connected</div>
+
+    <div class="bg-gray-950 rounded-xl p-2 mb-3">
+      <canvas id="vizCanvas" class="rounded-lg w-full block"></canvas>
+    </div>
+
+    <div class="flex gap-3 items-center flex-wrap mb-3">
+      <span id="timerDisp" class="font-mono text-2xl font-bold text-cyan-300">00:00</span>
+      <button id="recordBtn" onclick="startRecording()" disabled class="bg-red-700 hover:bg-red-600 px-6 py-2 rounded-xl font-semibold opacity-40 cursor-not-allowed">● Record</button>
+      <label class="flex items-center gap-2 text-sm cursor-pointer">
+        <input type="checkbox" onchange="vizMode=this.checked?'frequency':'waveform'" class="w-4 h-4">
+        Frequency bars
+      </label>
+    </div>
+
+    <div class="mb-1 text-xs text-gray-500 mb-1">VU Meter</div>
+    <div class="w-full bg-gray-800 rounded-full h-3 overflow-hidden">
+      <div id="vuMeter" class="h-3 rounded-full transition-all bg-green-500" style="width:0%"></div>
+    </div>
+  </div>
+
+  <div class="bg-gray-900 rounded-2xl p-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-lg font-semibold text-gray-300">Recordings (max ${MAX_RECORDINGS})</h2>
+      <span class="text-xs text-gray-500" id="recCount"></span>
+    </div>
+    <div id="recList"></div>
+  </div>
+</div>
+<script>
+window.addEventListener('load',()=>{setupCanvas();renderList();});
+</script>
+</body>
+</html>
